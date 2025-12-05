@@ -1,0 +1,162 @@
+name: Notify Jenkins on Kanban Changes
+
+on:
+  issues:
+    types: [opened, closed, reopened, labeled, unlabeled, edited]
+  issue_comment:
+    types: [created]
+  workflow_dispatch:
+
+jobs:
+  notify-jenkins:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Extract event information
+        id: extract
+        run: |
+          EVENT_NAME="${{ github.event_name }}"
+          EVENT_FILE="$GITHUB_EVENT_PATH"
+          ACTION="${{ github.event.action }}"
+
+          # Defaults
+          TITLE="No Title"
+          SUMMARY="No description provided"
+          URL=""
+          OLD_STATUS=""
+          NEW_STATUS=""
+          COMMENT=""
+          COMMENT_AUTHOR=""
+          CHANGES=""
+          OLD_LABELS=""
+
+          if [ -f "$EVENT_FILE" ]; then
+            # Extract issue title and summary
+            TITLE=$(jq -r '.issue.title // "No title"' "$EVENT_FILE")
+            RAW_SUMMARY=$(jq -r '.issue.body // ""' "$EVENT_FILE")
+            [ -z "$RAW_SUMMARY" ] && RAW_SUMMARY="No description provided"
+            
+            # Format summary - replace Markdown headers with pipe separators
+            FORMATTED_SUMMARY=$(echo "$RAW_SUMMARY" | \
+              sed 's/### /| /g' | \
+              sed 's/^#\{1,6\}[[:space:]]*//g' | \
+              tr '\n' ' ' | \
+              sed 's/| /\\n| /g' | \
+              sed 's/\\n\\n/\\n/g' | \
+              head -c 500)
+            
+            # Escape for JSON and output
+            SUMMARY=$(echo "$FORMATTED_SUMMARY" | sed 's/"/\\"/g')
+            
+            URL=$(jq -r '.issue.html_url // ""' "$EVENT_FILE")
+
+            # Labels
+            CHANGES=$(jq -r '[.issue.labels[].name] | join(", ")' "$EVENT_FILE")
+            OLD_LABELS=$(jq -r '[.changes.labels.from[].name] | join(", ")' "$EVENT_FILE" 2>/dev/null || echo "$CHANGES")
+
+            # Map status
+            case "$ACTION" in
+              opened)
+                NEW_STATUS="New Issue"
+                ;;
+              closed)
+                NEW_STATUS="Closed"
+                ;;
+              reopened)
+                NEW_STATUS="Reopened"
+                ;;
+              labeled|unlabeled)
+                NEW_STATUS="$CHANGES"
+                ;;
+              edited)
+                NEW_STATUS="Edited"
+                ;;
+              *)
+                NEW_STATUS="Updated"
+                ;;
+            esac
+
+            # Issue comment extraction
+            if [ "$EVENT_NAME" = "issue_comment" ]; then
+              COMMENT=$(jq -r '.comment.body // ""' "$EVENT_FILE")
+              [ -z "$COMMENT" ] && COMMENT=""
+              COMMENT=$(echo "$COMMENT" | tr -d '\n' | sed 's/"/\\"/g' | head -c 300)
+              COMMENT_AUTHOR=$(jq -r '.comment.user.login // ""' "$EVENT_FILE")
+              ACTION="New Comment"
+            fi
+          fi
+
+          # Set outputs
+          echo "title=$(echo "$TITLE" | sed 's/"/\\"/g')" >> $GITHUB_OUTPUT
+          echo "summary=$SUMMARY" >> $GITHUB_OUTPUT
+          echo "url=$URL" >> $GITHUB_OUTPUT
+          echo "old_status=$OLD_STATUS" >> $GITHUB_OUTPUT
+          echo "new_status=$NEW_STATUS" >> $GITHUB_OUTPUT
+          echo "comment=$COMMENT" >> $GITHUB_OUTPUT
+          echo "comment_author=$COMMENT_AUTHOR" >> $GITHUB_OUTPUT
+          echo "github_action=$ACTION" >> $GITHUB_OUTPUT
+          echo "changes=$(echo "$CHANGES" | sed 's/"/\\"/g')" >> $GITHUB_OUTPUT
+          echo "old_labels=$(echo "$OLD_LABELS" | sed 's/"/\\"/g')" >> $GITHUB_OUTPUT
+          echo "jenkins-generic-webhook-trigger-plugin_uuid=dummy-uuid" >> $GITHUB_OUTPUT
+
+          echo "=== EXTRACTION COMPLETE ==="
+          echo "Title: $TITLE"
+          echo "Action: $ACTION"
+          echo "New Status: $NEW_STATUS"
+
+      - name: Show Extracted Data
+        run: |
+          echo "=== EXTRACTED DATA ==="
+          echo "Event: ${{ github.event_name }}"
+          echo "Action: ${{ steps.extract.outputs.github_action }}"
+          echo "Title: ${{ steps.extract.outputs.title }}"
+          echo "Summary: ${{ steps.extract.outputs.summary }}"
+          echo "URL: ${{ steps.extract.outputs.url }}"
+          echo "Old Status: ${{ steps.extract.outputs.old_status }}"
+          echo "New Status: ${{ steps.extract.outputs.new_status }}"
+          echo "Old Labels: ${{ steps.extract.outputs.old_labels }}"
+          echo "New Labels: ${{ steps.extract.outputs.changes }}"
+          echo "Comment: ${{ steps.extract.outputs.comment }}"
+          echo "Comment Author: ${{ steps.extract.outputs.comment_author }}"
+          echo "======================="
+
+      - name: Create Jenkins Payload
+        id: payload
+        run: |
+          # Write payload with proper escaping
+          cat > payload.json << 'EOF'
+          {
+            "GITHUB_ISSUE_TITLE": "${{ steps.extract.outputs.title }}",
+            "GITHUB_ISSUE_SUMMARY": "${{ steps.extract.outputs.summary }}",
+            "GITHUB_ISSUE_URL": "${{ steps.extract.outputs.url }}",
+            "GITHUB_OLD_STATUS": "${{ steps.extract.outputs.old_status }}",
+            "GITHUB_NEW_STATUS": "${{ steps.extract.outputs.new_status }}",
+            "GITHUB_COMMENT": "${{ steps.extract.outputs.comment }}",
+            "GITHUB_COMMENT_AUTHOR": "${{ steps.extract.outputs.comment_author }}",
+            "GITHUB_EVENT_TYPE": "${{ github.event_name }}",
+            "GITHUB_ACTION": "${{ steps.extract.outputs.github_action }}",
+            "GITHUB_CHANGES": "${{ steps.extract.outputs.changes }}",
+            "GITHUB_OLD_LABELS": "${{ steps.extract.outputs.old_labels }}",
+            "jenkins-generic-webhook-trigger-plugin_uuid": "dummy-uuid"
+          }
+          EOF
+          
+          # Use envsubst to replace variables
+          apt-get update && apt-get install -y gettext-base
+          envsubst < payload.json > payload_final.json
+          
+          echo "=== PAYLOAD CONTENTS ==="
+          cat payload_final.json
+          echo "========================"
+
+      - name: Trigger Jenkins Build
+        env:
+          JENKINS_TOKEN: ${{ secrets.JENKINS_WEBHOOK_TOKEN }}
+          JENKINS_URL: "https://bessie-lowliest-abundantly.ngrok-free.dev"
+        run: |
+          echo "Sending webhook to Jenkins..."
+          curl -X POST \
+            "$JENKINS_URL/generic-webhook-trigger/invoke?token=$JENKINS_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d @payload_final.json
+          echo "Webhook sent successfully!"
