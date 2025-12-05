@@ -1,2 +1,2 @@
-# mwf_support
+# mwf-support
 Repository for reporting, tracking, and managing molecular workflow errors
